@@ -3,6 +3,8 @@
 
 # Except .gitignore itself
 !.gitignore
+# Except the README file
+!README.md
 
 # Include all .py files
 !*.py

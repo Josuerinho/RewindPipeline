@@ -3,7 +3,8 @@ import argparse
 import gzip
 from Bio import SeqIO
 
-CAPTURE_SEQ2 = "GCTCACCTATTAGCGGCTAAGG"
+DEFAULT_CAPTURE_SEQ = "GCTCACCTATTAGCGGCTAAGG"
+DEFAULT_BARCODE_LENGTH = 84
 
 # Define the sets for W, S, and N conditions
 W = set('AT')
@@ -21,9 +22,10 @@ def count_wsn_mismatches(sequence):
         # N is skipped as it can be any nucleotide
     return mismatches
 
-def rewind_extractor(fastq1_path, fastq2_path, output_path, instrument_run_flowcell_ID):
+def rewind_extractor(fastq1_path, fastq2_path, output_path, instrument_run_flowcell_ID,
+                     capture_seq=DEFAULT_CAPTURE_SEQ, barcode_length=DEFAULT_BARCODE_LENGTH):
     """
-    Extracts cell barcodes, UMIs, and 84 nt lineage barcodes from read1 and read2 FASTQ files, respectively,
+    Extracts cell barcodes, UMIs, and lineage barcodes from read1 and read2 FASTQ files, respectively,
     and writes them to an output file along with the number of mismatches to the WSN pattern.
 
     Parameters
@@ -31,11 +33,18 @@ def rewind_extractor(fastq1_path, fastq2_path, output_path, instrument_run_flowc
     fastq1_path : str
         Path to the read1 FASTQ file which contains cell barcodes and UMIs.
     fastq2_path : str
-        Path to the read2 FASTQ file which contains the 84 nt lineage barcodes.
+        Path to the read2 FASTQ file which contains the lineage barcodes.
     output_path : str
         Path to the output file where results will be saved.
-    num_lines : int
-        Number of lines to process for testing.
+    instrument_run_flowcell_ID : str
+        The instrument:run:flowcell prefix string from the FASTQ read header, used to
+        split record.id and extract the lane:tile:x:y read identifier portion.
+    capture_seq : str
+        The capture sequence used to locate lineage barcodes in Read 2.
+        Default: 'GCTCACCTATTAGCGGCTAAGG'
+    barcode_length : int
+        Length of the lineage barcode (in nt) upstream of the capture sequence.
+        Default: 84
 
     Output
     ------
@@ -43,7 +52,7 @@ def rewind_extractor(fastq1_path, fastq2_path, output_path, instrument_run_flowc
     - readid: The identifier for the read.
     - cell_barcode: The cell barcode extracted from read1.
     - umi: The UMI extracted from read1.
-    - lineage_barcode: The 84 nt lineage barcode extracted from read2.
+    - lineage_barcode: The lineage barcode extracted from read2.
     - mismatches: The number of mismatches between the lineage barcode and the expected WSN pattern.
 
     Example
@@ -81,10 +90,10 @@ def rewind_extractor(fastq1_path, fastq2_path, output_path, instrument_run_flowc
         for i, record in enumerate(SeqIO.parse(f2, "fastq")):
             read_id = record.id.split(instrument_run_flowcell_ID)[1]
             read2_sequence = str(record.seq)
-            capture_seq2_index = read2_sequence.find(CAPTURE_SEQ2)
+            capture_seq2_index = read2_sequence.find(capture_seq)
             if capture_seq2_index != -1:
                 number_of_reads_with_captureseq2 += 1
-                lineage_barcode_start = capture_seq2_index - 84
+                lineage_barcode_start = capture_seq2_index - barcode_length
                 if lineage_barcode_start >= 0:
                     lineage_barcode = read2_sequence[lineage_barcode_start:capture_seq2_index]
                     mismatches = count_wsn_mismatches(lineage_barcode)
@@ -108,10 +117,21 @@ def main():
     parser.add_argument('--fastq1', type=str, required=True, help='Path to the read1 FASTQ file')
     parser.add_argument('--fastq2', type=str, required=True, help='Path to the read2 FASTQ file')
     parser.add_argument('--output', type=str, required=True, help='Path to the output file')
-    parser.add_argument('--instrument-run-flowcell-ID', type=str, required=True, help='instrument, run, and flowcell IDs of the fastq read header separated by :, ej AV100007:PY055:2336402118:')
+    parser.add_argument('--instrument-run-flowcell-ID', type=str, required=True,
+                        help='Instrument:Run:Flowcell ID prefix from the FASTQ read header, '
+                             'used to split read IDs. Example: "AV100007:PY055:2336402118:" — '
+                             'the code calls record.id.split(this_value) to extract the '
+                             'lane:tile:x:y portion after this prefix.')
+    parser.add_argument('--capture-seq', type=str, default=DEFAULT_CAPTURE_SEQ,
+                        help='Capture sequence used to locate lineage barcodes in Read 2. '
+                             f'(default: {DEFAULT_CAPTURE_SEQ})')
+    parser.add_argument('--barcode-length', type=int, default=DEFAULT_BARCODE_LENGTH,
+                        help='Length of the lineage barcode (nt) upstream of the capture sequence. '
+                             f'(default: {DEFAULT_BARCODE_LENGTH})')
     args = parser.parse_args()
 
-    rewind_extractor(args.fastq1, args.fastq2, args.output, args.instrument_run_flowcell_ID)
+    rewind_extractor(args.fastq1, args.fastq2, args.output, args.instrument_run_flowcell_ID,
+                     capture_seq=args.capture_seq, barcode_length=args.barcode_length)
 
 if __name__ == "__main__":
     main()

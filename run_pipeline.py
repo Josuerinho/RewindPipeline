@@ -110,6 +110,12 @@ def parse_args():
 
     # -- Tunable parameters --
     tune = parser.add_argument_group("Tunable parameters")
+    tune.add_argument("--capture-seq", default="GCTCACCTATTAGCGGCTAAGG",
+                      help="Capture sequence used to locate lineage barcodes in Read 2 "
+                           "(default: GCTCACCTATTAGCGGCTAAGG)")
+    tune.add_argument("--barcode-length", type=int, default=84,
+                      help="Length of the lineage barcode (nt) upstream of the capture "
+                           "sequence (default: 84)")
     tune.add_argument("--max-mismatches", type=int, default=0,
                       help="Max WSN mismatches for Step 2 filtering (default: 0)")
     tune.add_argument("--min-reads-count", type=int, default=1,
@@ -186,7 +192,9 @@ def main():
             f'--fastq1 {args.fastq1} '
             f'--fastq2 {args.fastq2} '
             f'--output {f_extracted} '
-            f'--instrument-run-flowcell-ID "{args.instrument_run_flowcell_ID}"',
+            f'--instrument-run-flowcell-ID "{args.instrument_run_flowcell_ID}" '
+            f'--capture-seq {args.capture_seq} '
+            f'--barcode-length {args.barcode_length}',
             1, TOTAL, "Extract barcodes from FASTQ files"
         )
 

@@ -66,15 +66,43 @@ RewindPipeline/
 ## Detailed Script Descriptions
 
 ### Step 1: `rewind_extractor.py`
-**Purpose:** Extracts cell barcodes (16 nt), UMIs (12 nt), and 84 nt lineage barcodes from paired-end FASTQ files (10x Genomics format). Locates lineage barcodes in Read 2 by searching for the capture sequence (`GCTCACCTATTAGCGGCTAAGG`) and extracting the 84 nt upstream. Counts mismatches to the expected **WSN trinucleotide repeat pattern** (W = A/T, S = G/C, N = any).
+**Purpose:** Extracts cell barcodes (16 nt), UMIs (12 nt), and lineage barcodes from paired-end FASTQ files (10x Genomics format). Locates lineage barcodes in Read 2 by searching for a configurable capture sequence (default: `GCTCACCTATTAGCGGCTAAGG`) and extracting a configurable number of nucleotides upstream (default: 84 nt). Counts mismatches to the expected **WSN trinucleotide repeat pattern** (W = A/T, S = G/C, N = any).
 
 ```bash
 python rewind_extractor.py \
   --fastq1 <read1.fastq.gz> \
   --fastq2 <read2.fastq.gz> \
   --output <rewind_address.tsv> \
-  --instrument-run-flowcell-ID <e.g., AV100007:PY055:2336402118:>
+  --instrument-run-flowcell-ID <e.g., AV100007:PY055:2336402118:> \
+  --capture-seq GCTCACCTATTAGCGGCTAAGG \
+  --barcode-length 84
 ```
+
+#### Understanding `--instrument-run-flowcell-ID`
+
+This parameter is the **prefix string** from your FASTQ read headers that identifies the instrument, run, and flowcell. It is used as a **string delimiter** in `record.id.split(prefix)` to strip the prefix and extract the unique lane:tile:x:y portion of each read ID.
+
+A typical FASTQ read ID looks like:
+
+```
+@AV100007:PY055:2336402118:1:1101:3425:1000
+```
+
+This has the structure: `instrument:run:flowcell:lane:tile:x:y`
+
+By passing `--instrument-run-flowcell-ID "AV100007:PY055:2336402118:"` (note the trailing colon), the code performs:
+
+```python
+record.id.split("AV100007:PY055:2336402118:")
+# → ["", "1:1101:3425:1000"]
+```
+
+This extracts `"1:1101:3425:1000"` (the lane:tile:x:y portion) as the unique read identifier. The trailing colon ensures a clean split. You should copy this prefix directly from the first line of your FASTQ file, including the trailing colon.
+
+#### Configurable capture sequence and barcode length
+
+- **`--capture-seq`**: The DNA sequence in Read 2 used to locate the lineage barcode. The barcode is extracted immediately upstream of this sequence. Change this if using a different plasmid backbone. Default: `GCTCACCTATTAGCGGCTAAGG`.
+- **`--barcode-length`**: Number of nucleotides upstream of the capture sequence to extract as the lineage barcode. Increase this if your barcode construct is longer than 84 nt. Default: `84`.
 
 **Output format:** `readid \t cell_barcode \t umi \t lineage_barcode \t mismatches`
 
@@ -243,7 +271,7 @@ pip install numpy pandas biopython matplotlib seaborn scipy
 |-------|-------------|
 | **Read 1 FASTQ** (`.fastq.gz`) | Contains cell barcodes (first 16 nt) and UMIs (next 12 nt) |
 | **Read 2 FASTQ** (`.fastq.gz`) | Contains lineage barcodes (84 nt upstream of capture sequence) |
-| **Instrument/Run/Flowcell ID** | Header prefix from FASTQ read IDs (e.g., `AV100007:PY055:2336402118:`) |
+| **Instrument/Run/Flowcell ID** | Header prefix from FASTQ read IDs used to extract lane:tile:x:y (e.g., `AV100007:PY055:2336402118:`) — see [Step 1 docs](#understanding---instrument-run-flowcell-id) for details |
 | **Barcode translation whitelist** | TSV mapping feature barcoding cell barcodes to gene expression cell barcodes (plain or `.gz`) |
 | **eDROPs filtered cell list** | TSV of cell barcodes that pass gene expression QC (barcode, molecule count, gene count) |
 | **Starcode executable** | Path to compiled Starcode binary |
@@ -321,6 +349,8 @@ python rewind_barcode_filtering_and_clone_assignment.py \
 
 | Parameter | Script | Default | Description |
 |-----------|--------|---------|-------------|
+| `--capture-seq` | `rewind_extractor.py` | `GCTCACCTATTAGCGGCTAAGG` | Capture sequence for locating lineage barcodes in Read 2 |
+| `--barcode-length` | `rewind_extractor.py` | `84` | Lineage barcode length (nt) upstream of capture sequence |
 | `--max_mismatches` | `filter_by_mismatch.py` | — | Max allowed WSN pattern mismatches (0 = perfect match only) |
 | `technology` | `collapse.py` | — | Library chemistry: `10xv2`, `10xv3`, `DropSeqv1`, `DropSeqv2`, `PearSeq`, `CiteSeq5v2`, `CiteSeq3v3`, `CiteSeqTSB` |
 | `--min-reads-count` | `translate_and_filter_cell_barcodes.py` | — | Minimum reads per molecule to retain |
@@ -368,6 +398,23 @@ python run_pipeline.py \
   --max-lineage-count 15
 ```
 
+### Custom capture sequence and barcode length
+
+If your plasmid uses a different capture sequence or a longer barcode region:
+
+```bash
+python run_pipeline.py \
+  --fastq1 sample_R1.fastq.gz \
+  --fastq2 sample_R2.fastq.gz \
+  --instrument-run-flowcell-ID "AV100007:PY055:2336402118:" \
+  --technology 10xv3 \
+  --whitelist-file barcode_translation.tsv.gz \
+  --edrops-file edrops_filtered_cells.tsv \
+  --starcode-path /path/to/starcode \
+  --capture-seq ATCGATCGATCGATCGATCG \
+  --barcode-length 120
+```
+
 ### Features
 
 - **All parameters configurable** — every tunable parameter from the individual scripts is exposed as a CLI flag
@@ -389,6 +436,8 @@ python run_pipeline.py \
 | `--starcode-path` | *required* | Path to Starcode binary |
 | `--output-dir` | `rewind_output` | Output directory |
 | `--sample-name` | `rewind` | File name prefix |
+| `--capture-seq` | `GCTCACCTATTAGCGGCTAAGG` | Capture sequence for locating lineage barcodes in Read 2 |
+| `--barcode-length` | `84` | Lineage barcode length (nt) upstream of capture sequence |
 | `--max-mismatches` | `0` | WSN mismatch threshold |
 | `--min-reads-count` | `1` | Min reads per molecule |
 | `--starcode-max-distance` | `3` | Starcode Levenshtein distance |
