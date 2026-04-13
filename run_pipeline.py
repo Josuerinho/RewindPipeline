@@ -133,13 +133,58 @@ def parse_args():
     tune.add_argument("--max-lineage-count", type=int, default=None,
                       help="Max lineage barcodes per cell for clone assignment (optional)")
 
+    # -- Timepoint matching (optional Step 11) --
+    tp = parser.add_argument_group("Timepoint matching (optional)")
+    tp.add_argument("--run-timepoint-matching", action="store_true",
+                    help="Run timepoint matching after Step 10 (requires --t0-reference)")
+    tp.add_argument("--t0-reference", default=None,
+                    help="Path to T0 cloneID_cloneBarcode.tsv for timepoint matching")
+    tp.add_argument("--t0-filtered-reference", default=None,
+                    help="(Optional) T0 rewind_filtered.tsv for UMI-weighted matching")
+    tp.add_argument("--hamming-threshold", type=int, default=2,
+                    help="Hamming distance threshold for fuzzy barcode matching (default: 2)")
+    tp.add_argument("--similarity-threshold", type=float, default=0.8,
+                    help="Minimum similarity for a valid match (default: 0.8)")
+    tp.add_argument("--top-n-matches", type=int, default=5,
+                    help="Top-N ranked matches per T1 clone (default: 5)")
+    tp.add_argument("--weight-by-umi", action="store_true",
+                    help="Weight similarity by UMI counts")
+    tp.add_argument("--matching-n-jobs", type=int, default=1,
+                    help="Parallel workers for timepoint matching (default: 1; 0=auto)")
+
+    # -- Differential enrichment analysis (optional Step 12) --
+    ea = parser.add_argument_group("Differential enrichment analysis (optional)")
+    ea.add_argument("--run-enrichment-analysis", action="store_true",
+                    help="Run differential enrichment analysis after timepoint matching "
+                         "(requires --control-reference and --treated-reference)")
+    ea.add_argument("--control-reference", default=None,
+                    help="Path to T1 Control cloneID_cloneBarcode.tsv file")
+    ea.add_argument("--treated-reference", default=None,
+                    help="Path to T1 Treated cloneID_cloneBarcode.tsv file "
+                         "(omit if the current pipeline run IS the treated sample)")
+    ea.add_argument("--control-matches", default=None,
+                    help="Path to Control best_matches.txt from timepoint matching")
+    ea.add_argument("--treated-matches-file", default=None,
+                    help="Path to Treated best_matches.txt from timepoint matching")
+    ea.add_argument("--control-filtered-reference", default=None,
+                    help="Path to Control rewind_filtered.tsv for UMI-based sizing")
+    ea.add_argument("--treated-filtered-reference", default=None,
+                    help="Path to Treated rewind_filtered.tsv for UMI-based sizing")
+    ea.add_argument("--pseudocount", type=float, default=1.0,
+                    help="Pseudocount for fold-change calculation (default: 1)")
+    ea.add_argument("--fdr-threshold", type=float, default=0.05,
+                    help="FDR q-value threshold for significance (default: 0.05)")
+    ea.add_argument("--log2fc-threshold", type=float, default=1.0,
+                    help="Log2 fold-change ratio threshold (default: 1.0)")
+
     # -- Control --
     ctrl = parser.add_argument_group("Pipeline control")
-    ctrl.add_argument("--start-step", type=int, default=1, choices=range(1, 11),
-                      help="Step to start from (1–10). Useful for resuming. "
+    ctrl.add_argument("--start-step", type=int, default=1, choices=range(1, 13),
+                      help="Step to start from (1–12). Useful for resuming. "
                            "Intermediate files must already exist. (default: 1)")
-    ctrl.add_argument("--stop-step", type=int, default=10, choices=range(1, 11),
-                      help="Step to stop after (1–10). (default: 10)")
+    ctrl.add_argument("--stop-step", type=int, default=10, choices=range(1, 13),
+                      help="Step to stop after (1–12; 11=timepoint matching, "
+                           "12=enrichment analysis). (default: 10)")
     ctrl.add_argument("--python", default=sys.executable,
                       help="Python interpreter to use (default: current interpreter)")
 
@@ -286,6 +331,106 @@ def main():
             f'{mlc_flag}',
             10, TOTAL, "Filter noise & assign clone IDs"
         )
+
+    # --- Step 11 (optional): Timepoint matching ---
+    if args.run_timepoint_matching and args.start_step <= 11 <= args.stop_step:
+        if not args.t0_reference:
+            print("WARNING: --run-timepoint-matching requires --t0-reference. Skipping Step 11.")
+        else:
+            # Derive T1 clone barcode file from Step 10 outputs
+            corrected_base = os.path.splitext(f_corrected)[0]
+            z_suffix = f"z{args.z_threshold}"
+            mlc_suffix = f"_mlc{args.max_lineage_count}" if args.max_lineage_count else ""
+            t1_clone_barcode = f"{corrected_base}.{z_suffix}{mlc_suffix}.cloneID_cloneBarcode.tsv"
+            t1_filtered = f"{corrected_base}.{z_suffix}.rewind_filtered.tsv"
+
+            matching_output = os.path.join(d, "timepoint_matching")
+
+            umi_flags = ""
+            if args.weight_by_umi:
+                t0_filt = args.t0_filtered_reference or ""
+                if t0_filt:
+                    umi_flags = (
+                        f"--weight-by-umi "
+                        f"--t0-filtered {t0_filt} "
+                        f"--t1-filtered {t1_filtered} "
+                    )
+
+            run_cmd(
+                f'{py} {os.path.join(pipeline_dir, "match_timepoints.py")} '
+                f'--t0-clone-barcode {args.t0_reference} '
+                f'--t1-clone-barcode {t1_clone_barcode} '
+                f'--output-dir {matching_output} '
+                f'--hamming-threshold {args.hamming_threshold} '
+                f'--similarity-threshold {args.similarity_threshold} '
+                f'--top-n-matches {args.top_n_matches} '
+                f'--n-jobs {args.matching_n_jobs} '
+                f'{umi_flags}',
+                11, TOTAL + 1, "Timepoint matching (T1 → T0)"
+            )
+
+    # --- Step 12 (optional): Differential enrichment analysis ---
+    if args.run_enrichment_analysis and args.start_step <= 12 <= args.stop_step:
+        if not args.t0_reference:
+            print("WARNING: --run-enrichment-analysis requires --t0-reference. Skipping Step 12.")
+        elif not args.control_reference:
+            print("WARNING: --run-enrichment-analysis requires --control-reference. Skipping Step 12.")
+        else:
+            # Derive file paths
+            corrected_base = os.path.splitext(f_corrected)[0]
+            z_suffix = f"z{args.z_threshold}"
+            mlc_suffix = f"_mlc{args.max_lineage_count}" if args.max_lineage_count else ""
+
+            # T0 clone barcode file is the user-supplied --t0-reference
+            t0_clones = args.t0_reference
+
+            # Control clone barcode file
+            ctrl_clones = args.control_reference
+
+            # Treated clone barcode file: use --treated-reference, or this run's own output
+            if args.treated_reference:
+                treat_clones = args.treated_reference
+            else:
+                treat_clones = f"{corrected_base}.{z_suffix}{mlc_suffix}.cloneID_cloneBarcode.tsv"
+
+            # Matching results
+            matching_output = os.path.join(d, "timepoint_matching")
+            ctrl_matches = args.control_matches or os.path.join(matching_output, "control_best_matches.txt")
+            treat_matches = args.treated_matches_file or os.path.join(matching_output, "best_matches.txt")
+
+            enrichment_output = os.path.join(d, "enrichment_analysis")
+
+            # Build optional filtered-file flags
+            filt_flags = ""
+            t0_filt = args.t0_filtered_reference
+            ctrl_filt = args.control_filtered_reference
+            treat_filt = args.treated_filtered_reference
+            if not treat_filt:
+                # If current run is the treated sample, use its own filtered file
+                treat_filt_auto = f"{corrected_base}.{z_suffix}.rewind_filtered.tsv"
+                if os.path.isfile(treat_filt_auto):
+                    treat_filt = treat_filt_auto
+            if t0_filt:
+                filt_flags += f"--t0-filtered {t0_filt} "
+            if ctrl_filt:
+                filt_flags += f"--control-filtered {ctrl_filt} "
+            if treat_filt:
+                filt_flags += f"--treated-filtered {treat_filt} "
+
+            run_cmd(
+                f'{py} {os.path.join(pipeline_dir, "differential_enrichment_analysis.py")} '
+                f'--t0-clones {t0_clones} '
+                f'--control-clones {ctrl_clones} '
+                f'--treated-clones {treat_clones} '
+                f'--control-matches {ctrl_matches} '
+                f'--treated-matches {treat_matches} '
+                f'--output-dir {enrichment_output} '
+                f'--pseudocount {args.pseudocount} '
+                f'--fdr-threshold {args.fdr_threshold} '
+                f'--log2fc-threshold {args.log2fc_threshold} '
+                f'{filt_flags}',
+                12, TOTAL + 2, "Differential enrichment analysis"
+            )
 
     elapsed = time.time() - t_start
     print(f"\n{'='*60}")

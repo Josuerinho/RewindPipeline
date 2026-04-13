@@ -525,6 +525,305 @@ The truncated Poisson fit (QC check in Step 10) tests whether the observed distr
 
 ---
 
+## Timepoint Matching Analysis
+
+When you have data from two experimental timepoints (e.g., T0 baseline and T1 after treatment), you can match T1 clones back to their T0 ancestors using the **`match_timepoints.py`** script. This is useful for tracking clonal dynamics such as drug resistance or differential expansion.
+
+### Algorithm
+
+1. **Load** clone → barcode mappings from both timepoints (`*_cloneID_cloneBarcode.tsv` from Step 10).
+2. **Fuzzy barcode matching**: For each barcode in a T1 clone, find all T0 barcodes within a configurable Hamming distance threshold (default: 2). This accounts for sequencing errors and low-level barcode mutations.
+3. **Candidate scoring**: For each (T1 clone, T0 clone) candidate pair, compute a **Fuzzy Jaccard similarity**:
+   ```
+   similarity = |matched_barcodes| / |T1_barcodes ∪ T0_barcodes|
+   ```
+   Optionally, similarity can be weighted by UMI counts to prioritise high-confidence barcodes.
+4. **Ranking and filtering**: Rank T0 candidates per T1 clone; report top-N matches and flag T1 clones below the similarity threshold as unmatched.
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--hamming-threshold` | 2 | Max Hamming distance for fuzzy barcode matching |
+| `--similarity-threshold` | 0.8 | Min Fuzzy Jaccard score to accept a match |
+| `--top-n-matches` | 5 | Number of ranked T0 candidates per T1 clone |
+| `--weight-by-umi` | off | Weight similarity by UMI counts |
+| `--n-jobs` | 1 | Parallel workers (0 = auto-detect) |
+
+### Standalone Usage
+
+```bash
+# Basic matching
+python match_timepoints.py \
+    --t0-clone-barcode T0_cloneID_cloneBarcode.tsv \
+    --t1-clone-barcode T1_cloneID_cloneBarcode.tsv \
+    --output-dir timepoint_matching_results
+
+# With UMI weighting and relaxed Hamming threshold
+python match_timepoints.py \
+    --t0-clone-barcode T0_cloneID_cloneBarcode.tsv \
+    --t1-clone-barcode T1_cloneID_cloneBarcode.tsv \
+    --t0-filtered T0_rewind_filtered.tsv \
+    --t1-filtered T1_rewind_filtered.tsv \
+    --weight-by-umi \
+    --hamming-threshold 3 \
+    --similarity-threshold 0.85 \
+    --n-jobs 4 \
+    --output-dir timepoint_matching_results
+```
+
+### Integrated Pipeline Usage
+
+Add `--run-timepoint-matching` and `--t0-reference` to `run_pipeline.py`:
+
+```bash
+python run_pipeline.py \
+    --fastq1 T1_R1.fastq.gz \
+    --fastq2 T1_R2.fastq.gz \
+    --instrument-run-flowcell-ID "INSTRUMENT:RUN:FLOWCELL:" \
+    --technology 10xv3 \
+    --whitelist-file barcode_translation.tsv.gz \
+    --edrops-file edrops_filtered_cells.tsv \
+    --starcode-path /path/to/starcode \
+    --output-dir T1_results/ \
+    --sample-name T1_sample \
+    --run-timepoint-matching \
+    --t0-reference /path/to/T0_cloneID_cloneBarcode.tsv \
+    --stop-step 11
+```
+
+### Output Files
+
+| File | Description |
+|---|---|
+| `best_matches.txt` | Best T0 match per T1 clone (T1_clone_id, T0_clone_id, similarity, counts) |
+| `ranked_matches.txt` | Top-N T0 matches per T1 clone with scores |
+| `unmatched_clones.txt` | T1 clones whose best match is below the similarity threshold |
+| `matching_statistics.txt` | Summary: match rate, mean/median/std similarity, etc. |
+| `plots/` | QC visualisations (see below) |
+
+### QC Plots
+
+- **similarity_histogram.png** — Distribution of best-match scores with threshold line
+- **clone_size_scatter.png** — T0 vs T1 clone size coloured by similarity
+- **matched_vs_unmatched.png** — Bar chart of match status counts
+- **top_matches_heatmap.png** — Heatmap of highest-scoring clone pairs
+- **similarity_vs_matched_count.png** — Scatter of similarity vs. number of shared barcodes
+
+### Interpreting Results
+
+- **High similarity (≥ 0.9)**: Confident one-to-one match. The T1 clone is almost certainly descended from that T0 clone.
+- **Moderate similarity (0.7–0.9)**: Likely match but with barcode dropout. Inspect the number of matched barcodes — higher counts increase confidence.
+- **Low similarity (< 0.7)**: Ambiguous. Multiple T0 candidates may share a few barcodes. Consider these matches provisional.
+- **Unmatched clones**: May indicate very high dropout, novel barcode combinations from recombination, or rare clones whose T0 ancestor had too few cells to be detected.
+- **Multiple high-scoring T0 matches**: Could indicate closely related clones in T0 or barcode sharing artifacts. The ranked output helps assess this.
+
+### Scalability
+
+The algorithm is designed for large datasets (80K × 20K comparisons):
+- Uses dictionary-based indexing to avoid exhaustive pairwise comparisons
+- Only computes similarity for T0 clones that share at least one fuzzy-matched barcode with the T1 clone
+- Supports multiprocessing via `--n-jobs` for CPU-parallel matching
+- Progress bars report completion during long runs
+
+---
+
+## Differential Enrichment Analysis
+
+### Overview
+
+The **Differential Enrichment Analysis** (Step 12) identifies clones that are significantly enriched or depleted due to drug selection by comparing the Treated/T0 fold-change against the Control/T0 fold-change. Using the untreated Control population as a reference accounts for **random clonal drift** (stochastic changes in clone frequency during the 2-month passage), ensuring that only drug-specific effects are reported as significant.
+
+### Statistical Framework
+
+For every clone observed at T0, the analysis computes:
+
+1. **Fold-changes** (with a configurable pseudocount, default = 1):
+   - `FC_control = (Control_size + pseudocount) / (T0_size + pseudocount)`
+   - `FC_treated = (Treated_size + pseudocount) / (T0_size + pseudocount)`
+
+2. **Log2 Fold-Change Ratio** — the key metric:
+   - `Log2_FC_ratio = log2(FC_treated / FC_control)`
+   - A positive value means the clone grew more under drug treatment than in the control.
+   - A negative value means the clone shrank more under drug treatment.
+
+3. **Fisher's exact test** for each clone on the 2×2 contingency table `[[T0+1, Control+1], [T0+1, Treated+1]]` to assess whether the difference in fold-changes is statistically significant.
+
+4. **Benjamini-Hochberg FDR correction** to control false discoveries across many simultaneous tests.
+
+5. **Classification** (configurable thresholds):
+   - **Enriched**: q < 0.05 AND Log2_FC_ratio > 1.0
+   - **Depleted**: q < 0.05 AND Log2_FC_ratio < −1.0
+   - **Neutral**: everything else
+
+### Why the Control Is Essential
+
+Without a Control population, any observed change in clone frequency from T0→T1 could be due to:
+- Random drift during passage
+- Differences in sequencing depth
+- Sampling noise
+
+By normalising Treated fold-changes against Control fold-changes, these confounders cancel out and the remaining signal reflects **drug-specific** selection.
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--pseudocount` | 1 | Added to numerator and denominator before fold-change calculation. Prevents division by zero and stabilises ratios for small clones. |
+| `--fdr-threshold` | 0.05 | q-value cutoff for significance. |
+| `--log2fc-threshold` | 1.0 | Minimum absolute Log2 FC ratio required (in addition to FDR) to call a clone enriched/depleted. A value of 1.0 means the clone must show at least a 2-fold difference between Treated and Control. |
+
+### Standalone Usage
+
+After running the pipeline (Steps 1–10) on all three populations (T0, Control, Treated) and performing timepoint matching (Step 11), run enrichment analysis independently:
+
+```bash
+python differential_enrichment_analysis.py \
+    --t0-clones T0_output/rewind_corrected_UMI_counts.z2.cloneID_cloneBarcode.tsv \
+    --control-clones Control_output/rewind_corrected_UMI_counts.z2.cloneID_cloneBarcode.tsv \
+    --treated-clones Treated_output/rewind_corrected_UMI_counts.z2.cloneID_cloneBarcode.tsv \
+    --control-matches control_matching/best_matches.txt \
+    --treated-matches treated_matching/best_matches.txt \
+    --output-dir enrichment_results
+```
+
+With UMI-based clone sizing (recommended when rewind_filtered.tsv files are available):
+
+```bash
+python differential_enrichment_analysis.py \
+    --t0-clones T0_cloneID_cloneBarcode.tsv \
+    --control-clones Control_cloneID_cloneBarcode.tsv \
+    --treated-clones Treated_cloneID_cloneBarcode.tsv \
+    --control-matches control_matching/best_matches.txt \
+    --treated-matches treated_matching/best_matches.txt \
+    --t0-filtered T0_rewind_filtered.tsv \
+    --control-filtered Control_rewind_filtered.tsv \
+    --treated-filtered Treated_rewind_filtered.tsv \
+    --output-dir enrichment_results \
+    --pseudocount 1 --fdr-threshold 0.05 --log2fc-threshold 1.0
+```
+
+### Integrated Pipeline Usage
+
+Run enrichment analysis as part of the pipeline (Steps 1–12). This is useful when the current pipeline run is the Treated sample:
+
+```bash
+python run_pipeline.py \
+    --fastq1 treated_R1.fastq.gz --fastq2 treated_R2.fastq.gz \
+    --instrument-run-flowcell-ID "INSTRUMENT:RUN:FLOWCELL:" \
+    --technology 10xv3 \
+    --whitelist-file barcode_translation.tsv.gz \
+    --edrops-file edrops_filtered_cells.tsv \
+    --starcode-path /path/to/starcode \
+    --output-dir treated_output \
+    --run-timepoint-matching --t0-reference T0_cloneID_cloneBarcode.tsv \
+    --run-enrichment-analysis \
+    --control-reference Control_cloneID_cloneBarcode.tsv \
+    --control-matches control_matching/best_matches.txt \
+    --stop-step 12
+```
+
+### Output Files
+
+| File | Description |
+|------|-------------|
+| `differential_enrichment_results.txt` | Full results table with Clone_ID, T0_size, Control_size, Treated_size, FC_control, FC_treated, Log2_FC_ratio, p_value, q_value, Status |
+| `enriched_clones.txt` | Subset: significantly enriched clones only |
+| `depleted_clones.txt` | Subset: significantly depleted clones only |
+| `neutral_clones.txt` | Subset: non-significant clones |
+| `summary_statistics.txt` | Overview statistics and top enriched/depleted clones |
+| `plots/` | Directory with publication-quality visualisation plots |
+
+### QC Plots
+
+1. **Volcano plot** (`volcano_plot.png`): Log2_FC_ratio (x) vs −log10(q-value) (y). Enriched clones appear in the upper-right (red), depleted in the upper-left (blue). Dashed lines mark significance thresholds.
+
+2. **MA plot** (`ma_plot.png`): Log2 mean abundance (x) vs Log2_FC_ratio (y). Shows whether enrichment is related to clone size — important for spotting artefacts in very small or very large clones.
+
+3. **Clone trajectory plot** (`clone_trajectory_plot.png`): Log2 FC Control (x) vs Log2 FC Treated (y). Points on the diagonal grew equally in both conditions; points above the diagonal are preferentially enriched under treatment.
+
+4. **Enrichment distribution** (`enrichment_distribution.png`): Histogram of all Log2_FC_ratio values. A symmetric distribution centred near zero suggests most clones behave similarly; heavy tails indicate strong selection.
+
+5. **Top clones heatmap** (`top_clones_heatmap.png`): Log2 UMI counts for the top 20 enriched and top 20 depleted clones across T0, Control, and Treated.
+
+6. **Summary bar plot** (`summary_bar_plot.png`): Counts of Enriched / Neutral / Depleted clones.
+
+### Interpreting Results
+
+#### How to read the Volcano plot
+- **Upper-right quadrant** (high −log10(q), high Log2_FC): Clones that are both statistically significant and biologically meaningful — **true resistance candidates**.
+- **Upper-left quadrant**: Clones significantly **depleted** by the drug.
+- **Bottom band** (low −log10(q)): Clones without enough evidence for differential behaviour.
+
+#### What Log2_FC_ratio values mean
+| Log2_FC_ratio | Interpretation |
+|---------------|----------------|
+| > 2 | Clone grew >4× more in Treated vs Control — strong enrichment |
+| 1 to 2 | 2–4× enrichment — moderate |
+| −1 to 1 | Less than 2-fold difference — likely noise or drift |
+| −2 to −1 | 2–4× depletion — moderate sensitivity |
+| < −2 | >4× depletion — strong drug sensitivity |
+
+#### Identifying true resistance clones
+1. Start with the **enriched_clones.txt** file.
+2. Prioritise clones with high Log2_FC_ratio **and** low q-value.
+3. Cross-reference with the MA plot — very small clones with extreme fold-changes may be unreliable.
+4. Check the clone trajectory plot to confirm the clone grew specifically in the Treated arm.
+
+#### Common pitfalls
+- **Too many significant results?** Tighten thresholds: increase `--log2fc-threshold` or decrease `--fdr-threshold`.
+- **No significant results?** Check that timepoint matching worked well (inspect `matching_statistics.txt`). Consider relaxing thresholds or verifying that the drug is effective.
+- **Batch effects**: Ensure T0, Control, and Treated were processed with the same pipeline parameters.
+- **Very small clones**: A single-cell clone that drops out can produce extreme fold-changes; interpret with caution. The pseudocount helps, but small clones are inherently noisy.
+
+### Parameter Tuning Recommendations
+
+- **pseudocount**: Increase to 5–10 if you have many small clones and want to reduce extreme fold-changes in low-abundance clones. Keep at 1 for standard analysis.
+- **fdr-threshold**: 0.05 is standard. Use 0.01 for a more conservative analysis.
+- **log2fc-threshold**: 1.0 (2-fold) is a common biological cutoff. Use 0.585 (~1.5-fold) for more permissive analysis or 2.0 (4-fold) for strict filtering.
+
+### Example Workflow: FASTQ to Enrichment
+
+```bash
+# 1. Process T0 sample (Steps 1–10)
+python run_pipeline.py --fastq1 T0_R1.fq.gz --fastq2 T0_R2.fq.gz \
+    [pipeline params] --output-dir T0_output --sample-name T0
+
+# 2. Process Control sample (Steps 1–10)
+python run_pipeline.py --fastq1 Ctrl_R1.fq.gz --fastq2 Ctrl_R2.fq.gz \
+    [pipeline params] --output-dir Ctrl_output --sample-name Ctrl
+
+# 3. Process Treated sample (Steps 1–10)
+python run_pipeline.py --fastq1 Treat_R1.fq.gz --fastq2 Treat_R2.fq.gz \
+    [pipeline params] --output-dir Treat_output --sample-name Treat
+
+# 4. Run timepoint matching for Control → T0
+python match_timepoints.py \
+    --t0-clone-barcode T0_output/T0_corrected_UMI_counts.z2.cloneID_cloneBarcode.tsv \
+    --t1-clone-barcode Ctrl_output/Ctrl_corrected_UMI_counts.z2.cloneID_cloneBarcode.tsv \
+    --output-dir ctrl_matching
+
+# 5. Run timepoint matching for Treated → T0
+python match_timepoints.py \
+    --t0-clone-barcode T0_output/T0_corrected_UMI_counts.z2.cloneID_cloneBarcode.tsv \
+    --t1-clone-barcode Treat_output/Treat_corrected_UMI_counts.z2.cloneID_cloneBarcode.tsv \
+    --output-dir treat_matching
+
+# 6. Run differential enrichment analysis
+python differential_enrichment_analysis.py \
+    --t0-clones T0_output/T0_corrected_UMI_counts.z2.cloneID_cloneBarcode.tsv \
+    --control-clones Ctrl_output/Ctrl_corrected_UMI_counts.z2.cloneID_cloneBarcode.tsv \
+    --treated-clones Treat_output/Treat_corrected_UMI_counts.z2.cloneID_cloneBarcode.tsv \
+    --control-matches ctrl_matching/best_matches.txt \
+    --treated-matches treat_matching/best_matches.txt \
+    --t0-filtered T0_output/T0_corrected_UMI_counts.z2.rewind_filtered.tsv \
+    --control-filtered Ctrl_output/Ctrl_corrected_UMI_counts.z2.rewind_filtered.tsv \
+    --treated-filtered Treat_output/Treat_corrected_UMI_counts.z2.rewind_filtered.tsv \
+    --output-dir enrichment_results
+```
+
+---
+
 ## License
 
 Please refer to the repository owner for licensing information.
