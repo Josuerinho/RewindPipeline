@@ -826,4 +826,4 @@ python differential_enrichment_analysis.py \
 
 ## License
 
-Please refer to the repository owner for licensing information.
+Please refer to the repository owner ([Yim Ling Cheng](https://github.com/ylcheng/RewindPipeline)) for licensing information.
