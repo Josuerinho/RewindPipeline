@@ -78,14 +78,22 @@ def filter_barcodes(rewind_df, edrops_file_path):
     rewind_df : pd.DataFrame
         DataFrame with translated cell barcodes.
     edrops_file_path : str
-        Path to the edrops filtered cell barcodes file.
+        Path to the edrops filtered cell barcodes file. It can also be just the cell barcodes in a single column with no header.
 
     Returns
     -------
     pd.DataFrame
         DataFrame with filtered cell barcodes.
     """
-    edrops_df = pd.read_csv(edrops_file_path, sep='\t', header=None, names=['cell_barcode_gex', "molecules_count", "genes_count"])
+    
+    # adjust to accept the edrops file with just the cell barcodes in a single column with no header
+    edrops_df = pd.read_csv(edrops_file_path, sep='\t', header=None)
+    if edrops_df.shape[1] == 1:
+        edrops_df.columns = ['cell_barcode_gex']
+    elif edrops_df.shape[1] == 3:
+        edrops_df.columns = ['cell_barcode_gex', "molecules_count", "genes_count"]
+    else:
+        raise ValueError("edrops file should have either 1 column (cell_barcode_gex) or 3 columns (cell_barcode_gex, molecules_count, genes_count)")
     print(f'number of cell_barcode_gex in edrops: {edrops_df.shape[0]}')
 
     filtered_rewind_df = rewind_df[rewind_df['cell_barcode_gex'].isin(edrops_df['cell_barcode_gex'])]
