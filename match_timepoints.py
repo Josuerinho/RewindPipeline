@@ -228,10 +228,13 @@ def match_timepoints(
     similarity_threshold: float = 0.8,
     top_n: int = 5,
     weight_by_umi: bool = False,
-    t0_umi_weights: dict | None = None,
-    t1_umi_weights: dict | None = None,
+    # t0_umi_weights: dict | None = None, # make sure this type annotation is compatible with other python version (I think is only valid for 3.8+?)
+    t0_umi_weights = None,
+    # t1_umi_weights: dict | None = None,
+    t1_umi_weights = None,
     n_jobs: int = 1,
-) -> tuple:
+# ) -> tuple: # same problem with tuple type annotation. Remove it for now.
+):
     """
     Match T1 clones to T0 clones using fuzzy barcode matching.
 
