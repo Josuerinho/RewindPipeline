@@ -76,7 +76,7 @@ def filter_noise(df, top_n, z_threshold, min_group_size, target_sum=1e4):
     df = pd.merge(df, std_devs, on='lineage_count', how='left')
 
     # Identify small subpopulations
-    group_sizes = df.groupby('lineage_count')['lineage_count'].transform('size')
+    group_sizes = df.groupby('cell_barcode')['lineage_count'].transform('size')
     df['is_small_group'] = group_sizes < min_group_size
 
     # Compute the Z-score for log-normalized counts relative to the expected count and subpopulation std dev
