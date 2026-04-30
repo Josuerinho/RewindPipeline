@@ -61,6 +61,17 @@ def parse_args():
             "address data."
         ),
     )
+
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help=(
+            "Path four output files. If not provided, outputs will be written "
+            "to the same directory as the input file with appropriate suffixes."
+        ),
+    )
+
     parser.add_argument(
         "--input-file-2",
         type=str,
@@ -1022,7 +1033,15 @@ def main():
     if args.cross_condition and not args.input_file_2:
         raise ValueError("--cross-condition requires --input-file-2")
 
-    filebase = args.input_file.rsplit(".", 1)[0]
+    if args.output_dir:
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir)
+
+        prefix = os.path.basename(args.input_file).rsplit(".", 1)[0]
+        filebase = os.path.join(args.output_dir, prefix)
+    else:
+        filebase = args.input_file.rsplit(".", 1)[0]
+
     if args.max_lineage_count:
         zcfilebase = f"{filebase}.z{args.z_threshold}_mlc{args.max_lineage_count}"
         zfilebase = f"{filebase}.z{args.z_threshold}"
