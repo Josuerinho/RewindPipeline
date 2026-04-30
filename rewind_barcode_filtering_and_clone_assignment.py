@@ -19,6 +19,22 @@ _CROSS_CELL_DATA_2 = None
 _WITHIN_PARAMS = None
 _CROSS_PARAMS = None
 
+DETAILED_PAIRWISE_COLUMNS = [
+    "cell_barcode_1",
+    "cell_barcode_2",
+    "source_condition_1",
+    "source_condition_2",
+    "is_clone",
+    "num_matches",
+    "num_exact_matches",
+    "num_hamming_matches",
+    "num_barcode_comparisons",
+    "min_observed_distance",
+    "best_hamming_distance",
+    "mean_match_confidence",
+    "matched_barcode_pairs",
+]
+
 
 def parse_args():
     """
@@ -380,7 +396,7 @@ def _serialize_matches(matches):
 
 
 def _compare_two_cells(cell1, cell2, entries1, entries2, set1, set2, hamming_threshold, quick_mode, force_hamming_all, source_1, source_2):
-    """Compare lineage barcodes between two cells and return summary result row."""
+    """Compare lineage barcodes between two cells and return detailed match diagnostics."""
     if cell1 == cell2 and source_1 == source_2:
         return {
             "cell_barcode_1": cell1,
@@ -391,12 +407,16 @@ def _compare_two_cells(cell1, cell2, entries1, entries2, set1, set2, hamming_thr
             "num_matches": 0,
             "num_exact_matches": 0,
             "num_hamming_matches": 0,
+            "num_barcode_comparisons": 0,
+            "min_observed_distance": np.nan,
             "best_hamming_distance": np.nan,
             "mean_match_confidence": np.nan,
             "matched_barcode_pairs": "",
         }
 
     matches = []
+    num_barcode_comparisons = 0
+    min_observed_distance = np.nan
 
     # Quick optimization: exact intersections can be accepted immediately.
     exact_intersection = set1.intersection(set2) if quick_mode else set()
@@ -420,6 +440,9 @@ def _compare_two_cells(cell1, cell2, entries1, entries2, set1, set2, hamming_thr
                     "rank_2": e2["rank"],
                 }
             )
+            num_barcode_comparisons += 1
+
+        min_observed_distance = 0
 
         # In quick mode, stop early unless explicitly forced to evaluate all pairs.
         if not force_hamming_all:
@@ -434,6 +457,8 @@ def _compare_two_cells(cell1, cell2, entries1, entries2, set1, set2, hamming_thr
                 "num_matches": len(matches),
                 "num_exact_matches": len(matches),
                 "num_hamming_matches": 0,
+                "num_barcode_comparisons": num_barcode_comparisons,
+                "min_observed_distance": min_observed_distance,
                 "best_hamming_distance": min(dists) if dists else np.nan,
                 "mean_match_confidence": float(np.mean(confs)) if confs else np.nan,
                 "matched_barcode_pairs": _serialize_matches(matches),
@@ -443,6 +468,10 @@ def _compare_two_cells(cell1, cell2, entries1, entries2, set1, set2, hamming_thr
     for e1 in entries1:
         for e2 in entries2:
             dist = calculate_hamming_distance(e1["barcode"], e2["barcode"])
+            num_barcode_comparisons += 1
+            if np.isnan(min_observed_distance) or dist < min_observed_distance:
+                min_observed_distance = int(dist)
+
             if dist <= hamming_threshold:
                 conf = calculate_match_confidence(
                     e1["umi_count"], e2["umi_count"], e1["rank"], e2["rank"]
@@ -474,6 +503,8 @@ def _compare_two_cells(cell1, cell2, entries1, entries2, set1, set2, hamming_thr
         "num_matches": len(matches),
         "num_exact_matches": num_exact,
         "num_hamming_matches": num_hamming,
+        "num_barcode_comparisons": num_barcode_comparisons,
+        "min_observed_distance": min_observed_distance,
         "best_hamming_distance": min(dists) if dists else np.nan,
         "mean_match_confidence": float(np.mean(confs)) if confs else np.nan,
         "matched_barcode_pairs": _serialize_matches(matches),
@@ -565,27 +596,14 @@ def assign_clones_hamming(input_df, hamming_threshold=2, quick_mode=True, force_
     Returns
     -------
     pd.DataFrame
-        Detailed pairwise comparison results.
+        Detailed pairwise comparison results with diagnostic columns including
+        num_barcode_comparisons and min_observed_distance.
     """
     cell_data, cell_sets = _prepare_cell_barcode_data(input_df, max_lineage_count=max_lineage_count)
     cell_ids = sorted(cell_data.keys())
 
     if len(cell_ids) == 0:
-        return pd.DataFrame(
-            columns=[
-                "cell_barcode_1",
-                "cell_barcode_2",
-                "source_condition_1",
-                "source_condition_2",
-                "is_clone",
-                "num_matches",
-                "num_exact_matches",
-                "num_hamming_matches",
-                "best_hamming_distance",
-                "mean_match_confidence",
-                "matched_barcode_pairs",
-            ]
-        )
+        return pd.DataFrame(columns=DETAILED_PAIRWISE_COLUMNS)
 
     if len(cell_ids) == 1:
         cell = cell_ids[0]
@@ -600,11 +618,14 @@ def assign_clones_hamming(input_df, hamming_threshold=2, quick_mode=True, force_
                     "num_matches": 0,
                     "num_exact_matches": 0,
                     "num_hamming_matches": 0,
+                    "num_barcode_comparisons": 0,
+                    "min_observed_distance": np.nan,
                     "best_hamming_distance": np.nan,
                     "mean_match_confidence": np.nan,
                     "matched_barcode_pairs": "",
                 }
-            ]
+            ],
+            columns=DETAILED_PAIRWISE_COLUMNS,
         )
 
     pair_iter = itertools.combinations(cell_ids, 2)
@@ -631,7 +652,7 @@ def assign_clones_hamming(input_df, hamming_threshold=2, quick_mode=True, force_
         _init_within_worker(cell_data, cell_sets, params)
         rows = [_within_worker(pair) for pair in pair_iter]
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=DETAILED_PAIRWISE_COLUMNS)
 
 
 def assign_clones_cross_condition(df1, df2, hamming_threshold=2, quick_mode=True, force_hamming_all=False, max_lineage_count=None, n_jobs=1, source_condition_1="input_1", source_condition_2="input_2"):
@@ -662,7 +683,8 @@ def assign_clones_cross_condition(df1, df2, hamming_threshold=2, quick_mode=True
     Returns
     -------
     pd.DataFrame
-        Detailed cross-condition pairwise comparison results.
+        Detailed cross-condition pairwise comparison results with diagnostic
+        columns including num_barcode_comparisons and min_observed_distance.
     """
     cell_data_1, cell_sets_1 = _prepare_cell_barcode_data(df1, max_lineage_count=max_lineage_count)
     cell_data_2, cell_sets_2 = _prepare_cell_barcode_data(df2, max_lineage_count=max_lineage_count)
@@ -671,21 +693,7 @@ def assign_clones_cross_condition(df1, df2, hamming_threshold=2, quick_mode=True
     cells_2 = sorted(cell_data_2.keys())
 
     if len(cells_1) == 0 or len(cells_2) == 0:
-        return pd.DataFrame(
-            columns=[
-                "cell_barcode_1",
-                "cell_barcode_2",
-                "source_condition_1",
-                "source_condition_2",
-                "is_clone",
-                "num_matches",
-                "num_exact_matches",
-                "num_hamming_matches",
-                "best_hamming_distance",
-                "mean_match_confidence",
-                "matched_barcode_pairs",
-            ]
-        )
+        return pd.DataFrame(columns=DETAILED_PAIRWISE_COLUMNS)
 
     pair_iter = itertools.product(cells_1, cells_2)
     total_pairs = len(cells_1) * len(cells_2)
@@ -715,7 +723,7 @@ def assign_clones_cross_condition(df1, df2, hamming_threshold=2, quick_mode=True
         _init_cross_worker(cell_data_1, cell_sets_1, cell_data_2, cell_sets_2, params)
         rows = [_cross_worker(pair) for pair in pair_iter]
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=DETAILED_PAIRWISE_COLUMNS)
 
 
 def generate_clone_groups(detailed_results):
@@ -904,7 +912,13 @@ def save_results(
     )
 
     # New outputs
-    detailed_results_df.to_csv(
+    detailed_results_for_write = detailed_results_df.copy()
+    for col in DETAILED_PAIRWISE_COLUMNS:
+        if col not in detailed_results_for_write.columns:
+            detailed_results_for_write[col] = np.nan
+    detailed_results_for_write = detailed_results_for_write[DETAILED_PAIRWISE_COLUMNS]
+
+    detailed_results_for_write.to_csv(
         f"{zcfilebase}.clone_pairwise_detailed.tsv", sep="\t", index=False
     )
     clone_groups_df.to_csv(f"{zcfilebase}.clone_groups.tsv", sep="\t", index=False)
