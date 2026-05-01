@@ -1,7 +1,11 @@
 import argparse
+import datetime
+import io
 import itertools
+import json
 import multiprocessing as mp
 import os
+import sys
 from collections import defaultdict
 
 import matplotlib.pyplot as plt
@@ -35,6 +39,8 @@ DETAILED_PAIRWISE_COLUMNS = [
     "matched_barcode_pairs",
 ]
 
+GRAPH_HUB_DEGREE_THRESHOLD = 10
+
 
 def parse_args():
     """
@@ -61,17 +67,6 @@ def parse_args():
             "address data."
         ),
     )
-
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=None,
-        help=(
-            "Path four output files. If not provided, outputs will be written "
-            "to the same directory as the input file with appropriate suffixes."
-        ),
-    )
-
     parser.add_argument(
         "--input-file-2",
         type=str,
@@ -156,6 +151,31 @@ def parse_args():
             "Number of parallel worker processes for pairwise comparisons "
             "(default: 1; use 0 for auto-detect)."
         ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help=(
+            "Path for output files. If not provided, outputs will be written "
+            "to the same directory as the input file with appropriate suffixes."
+        ),
+    )
+    parser.add_argument(
+        "--save-graph",
+        dest="save_graph",
+        action="store_true",
+        default=True,
+        help=(
+            "Save clone graph exports (edge list TSV, node metadata TSV, and "
+            "graph JSON). Enabled by default."
+        ),
+    )
+    parser.add_argument(
+        "--no-save-graph",
+        dest="save_graph",
+        action="store_false",
+        help="Disable clone graph export files for very large datasets.",
     )
 
     return parser.parse_args()
@@ -749,15 +769,37 @@ def generate_clone_groups(detailed_results):
 
     Returns
     -------
-    pd.DataFrame
-        Dataframe with cloneID assignments per cell.
+    tuple
+        (clone_groups_df, clone_graph_dict)
+
+        clone_groups_df has clone assignments per cell.
+        clone_graph_dict stores graph nodes/edges/stats for downstream export.
     """
+    empty_clone_groups = pd.DataFrame(
+        columns=["cloneID", "source_condition", "cell_barcode", "clone_size", "degree"]
+    )
+    empty_graph = {
+        "nodes": [],
+        "edges": [],
+        "adjacency": defaultdict(set),
+        "components": [],
+        "stats": {
+            "total_nodes": 0,
+            "total_edges": 0,
+            "connected_components": 0,
+            "largest_component_size": 0,
+            "hub_degree_threshold": GRAPH_HUB_DEGREE_THRESHOLD,
+            "high_degree_nodes": [],
+        },
+    }
+
     if detailed_results.empty:
-        return pd.DataFrame(columns=["cloneID", "source_condition", "cell_barcode", "clone_size"])
+        return empty_clone_groups, empty_graph
 
     # Build graph over (source_condition, cell_barcode) nodes.
     all_nodes = set()
     adjacency = defaultdict(set)
+    clone_edges = []
 
     for row in detailed_results.itertuples(index=False):
         node1 = (row.source_condition_1, row.cell_barcode_1)
@@ -768,6 +810,36 @@ def generate_clone_groups(detailed_results):
         if bool(row.is_clone):
             adjacency[node1].add(node2)
             adjacency[node2].add(node1)
+            clone_edges.append(
+                {
+                    "source_condition_1": row.source_condition_1,
+                    "cell_barcode_1": row.cell_barcode_1,
+                    "source_condition_2": row.source_condition_2,
+                    "cell_barcode_2": row.cell_barcode_2,
+                    "num_matches": int(row.num_matches),
+                    "num_exact_matches": int(row.num_exact_matches),
+                    "num_hamming_matches": int(row.num_hamming_matches),
+                    "best_hamming_distance": (
+                        None if pd.isna(row.best_hamming_distance) else int(row.best_hamming_distance)
+                    ),
+                    "mean_match_confidence": (
+                        None
+                        if pd.isna(row.mean_match_confidence)
+                        else float(row.mean_match_confidence)
+                    ),
+                    "edge_weight": (
+                        0.0 if pd.isna(row.mean_match_confidence) else float(row.mean_match_confidence)
+                    ),
+                }
+            )
+
+    for node in all_nodes:
+        adjacency[node]  # ensure isolated nodes have empty adjacency sets
+
+    node_degrees = {
+        node: len(neighbors)
+        for node, neighbors in adjacency.items()
+    }
 
     visited = set()
     components = []
@@ -800,10 +872,38 @@ def generate_clone_groups(detailed_results):
                     "source_condition": source_condition,
                     "cell_barcode": cell_barcode,
                     "clone_size": len(comp),
+                    "degree": int(node_degrees.get((source_condition, cell_barcode), 0)),
                 }
             )
 
-    return pd.DataFrame(rows)
+    clone_groups_df = pd.DataFrame(rows)
+
+    high_degree_nodes = [
+        {
+            "source_condition": source_condition,
+            "cell_barcode": cell_barcode,
+            "degree": int(node_degrees.get((source_condition, cell_barcode), 0)),
+        }
+        for source_condition, cell_barcode in sorted(all_nodes)
+        if int(node_degrees.get((source_condition, cell_barcode), 0)) > GRAPH_HUB_DEGREE_THRESHOLD
+    ]
+
+    clone_graph = {
+        "nodes": sorted(all_nodes),
+        "edges": clone_edges,
+        "adjacency": adjacency,
+        "components": components,
+        "stats": {
+            "total_nodes": len(all_nodes),
+            "total_edges": len(clone_edges),
+            "connected_components": len(components),
+            "largest_component_size": max([len(comp) for comp in components], default=0),
+            "hub_degree_threshold": GRAPH_HUB_DEGREE_THRESHOLD,
+            "high_degree_nodes": high_degree_nodes,
+        },
+    }
+
+    return clone_groups_df, clone_graph
 
 
 def extract_unique_matched_cells(detailed_results, source_condition):
@@ -890,6 +990,136 @@ def _build_clone_barcode_outputs(filtered_df, clone_groups_df):
     )
 
     return cloneid_clonebarcode_df, cloneid_cellbarcode_df, clone_counts
+
+
+def save_clone_graph(output_prefix, clone_groups_df, clone_graph):
+    """Save clone graph exports as edge TSV, node TSV, and JSON node-link graph."""
+    if clone_groups_df.empty:
+        edge_df = pd.DataFrame(
+            columns=[
+                "node1",
+                "node2",
+                "num_matches",
+                "num_exact_matches",
+                "num_hamming_matches",
+                "best_hamming_distance",
+                "mean_match_confidence",
+                "edge_weight",
+            ]
+        )
+        node_df = pd.DataFrame(
+            columns=["cell_barcode", "source_condition", "degree", "assigned_clone_id"]
+        )
+        graph_json = {"directed": False, "graph": {}, "nodes": [], "links": []}
+    else:
+        def _node_id(source_condition, cell_barcode):
+            return f"{source_condition}|{cell_barcode}"
+
+        clone_lookup = {
+            (row.source_condition, row.cell_barcode): int(row.cloneID)
+            for row in clone_groups_df.itertuples(index=False)
+        }
+        degree_lookup = {
+            (row.source_condition, row.cell_barcode): int(row.degree)
+            for row in clone_groups_df.itertuples(index=False)
+        }
+
+        node_rows = []
+        json_nodes = []
+        for row in clone_groups_df.itertuples(index=False):
+            clone_label = f"Clone_{int(row.cloneID)}"
+            node_rows.append(
+                {
+                    "cell_barcode": row.cell_barcode,
+                    "source_condition": row.source_condition,
+                    "degree": int(row.degree),
+                    "assigned_clone_id": clone_label,
+                }
+            )
+            json_nodes.append(
+                {
+                    "id": _node_id(row.source_condition, row.cell_barcode),
+                    "cell_barcode": row.cell_barcode,
+                    "source_condition": row.source_condition,
+                    "degree": int(row.degree),
+                    "clone_id": clone_label,
+                }
+            )
+
+        edge_rows = []
+        json_links = []
+        for edge in clone_graph.get("edges", []):
+            source_node = _node_id(edge["source_condition_1"], edge["cell_barcode_1"])
+            target_node = _node_id(edge["source_condition_2"], edge["cell_barcode_2"])
+            source_clone_num = clone_lookup.get((edge["source_condition_1"], edge["cell_barcode_1"]))
+            target_clone_num = clone_lookup.get((edge["source_condition_2"], edge["cell_barcode_2"]))
+
+            edge_rows.append(
+                {
+                    "node1": source_node,
+                    "node2": target_node,
+                    "num_matches": edge["num_matches"],
+                    "num_exact_matches": edge["num_exact_matches"],
+                    "num_hamming_matches": edge["num_hamming_matches"],
+                    "best_hamming_distance": edge["best_hamming_distance"],
+                    "mean_match_confidence": edge["mean_match_confidence"],
+                    "edge_weight": edge["edge_weight"],
+                }
+            )
+            json_links.append(
+                {
+                    "source": source_node,
+                    "target": target_node,
+                    "source_condition_1": edge["source_condition_1"],
+                    "source_condition_2": edge["source_condition_2"],
+                    "num_matches": edge["num_matches"],
+                    "num_exact_matches": edge["num_exact_matches"],
+                    "num_hamming_matches": edge["num_hamming_matches"],
+                    "best_hamming_distance": edge["best_hamming_distance"],
+                    "mean_match_confidence": edge["mean_match_confidence"],
+                    "confidence": edge["mean_match_confidence"],
+                    "edge_weight": edge["edge_weight"],
+                    "hamming": edge["best_hamming_distance"],
+                    "source_clone_id": (
+                        None if source_clone_num is None else f"Clone_{source_clone_num}"
+                    ),
+                    "target_clone_id": (
+                        None if target_clone_num is None else f"Clone_{target_clone_num}"
+                    ),
+                    "source_degree": degree_lookup.get((edge["source_condition_1"], edge["cell_barcode_1"]), 0),
+                    "target_degree": degree_lookup.get((edge["source_condition_2"], edge["cell_barcode_2"]), 0),
+                }
+            )
+
+        edge_df = pd.DataFrame(
+            edge_rows,
+            columns=[
+                "node1",
+                "node2",
+                "num_matches",
+                "num_exact_matches",
+                "num_hamming_matches",
+                "best_hamming_distance",
+                "mean_match_confidence",
+                "edge_weight",
+            ],
+        )
+        edge_df = edge_df.sort_values(["node1", "node2"]).reset_index(drop=True)
+
+        node_df = pd.DataFrame(node_rows).sort_values(
+            ["source_condition", "cell_barcode"]
+        ).reset_index(drop=True)
+        graph_json = {
+            "directed": False,
+            "graph": {},
+            "nodes": json_nodes,
+            "links": json_links,
+        }
+
+    edge_df.to_csv(f"{output_prefix}.clone_graph_edges.tsv", sep="\t", index=False)
+    node_df.to_csv(f"{output_prefix}.clone_graph_nodes.tsv", sep="\t", index=False)
+    with open(f"{output_prefix}.clone_graph.json", "w") as f:
+        json.dump(graph_json, f, indent=2)
 
 
 def save_results(
@@ -1026,13 +1256,24 @@ def plot_clone_barcode_qc(filebase, clone_counts):
     plt.close()
 
 
-def main():
-    """Entry point: filter noise, assign clones, and write outputs."""
-    args = parse_args()
+class TeeStdout:
+    """Write stdout to terminal and an in-memory buffer."""
 
-    if args.cross_condition and not args.input_file_2:
-        raise ValueError("--cross-condition requires --input-file-2")
+    def __init__(self, original_stream, buffer):
+        self.original_stream = original_stream
+        self.buffer = buffer
 
+    def write(self, message):
+        self.original_stream.write(message)
+        self.buffer.write(message)
+
+    def flush(self):
+        self.original_stream.flush()
+        self.buffer.flush()
+
+
+def _resolve_file_bases(args):
+    """Build output file prefixes from args, including optional output directory."""
     if args.output_dir:
         if not os.path.exists(args.output_dir):
             os.makedirs(args.output_dir)
@@ -1049,87 +1290,195 @@ def main():
         zfilebase = f"{filebase}.z{args.z_threshold}"
         zcfilebase = f"{filebase}.z{args.z_threshold}"
 
-    print(filebase)
-    print(zfilebase)
-    print(zcfilebase)
+    return filebase, zfilebase, zcfilebase
 
-    # Load primary input and run noise filtering/QC
-    df = pd.read_csv(args.input_file, sep="\t")
-    df, filtered_df = filter_noise(df, args.top_n, args.z_threshold, args.min_group_size)
 
-    lineage_count_df = filtered_df[["cell_barcode", "lineage_count"]].drop_duplicates().reset_index(drop=True)
-    empirical_counts, expected_counts, empirical_cdf, expected_cdf, results = test_truncated_poisson_distribution(
-        lineage_count_df, "lineage_count"
-    )
-    plot_lineage_barcode_qc(zfilebase, empirical_counts, expected_counts, expected_cdf, empirical_cdf)
+def _safe_parse_arguments(args):
+    """Convert argparse namespace to a JSON-safe dict."""
+    parsed = {}
+    for key, value in vars(args).items():
+        try:
+            json.dumps(value)
+            parsed[key] = value
+        except TypeError:
+            parsed[key] = str(value)
+    return parsed
 
-    # Clone assignment mode
-    if args.cross_condition:
-        df2 = pd.read_csv(args.input_file_2, sep="\t")
-        _, filtered_df_2 = filter_noise(df2, args.top_n, args.z_threshold, args.min_group_size)
 
-        detailed_results_df = assign_clones_cross_condition(
-            filtered_df,
-            filtered_df_2,
-            hamming_threshold=args.hamming_threshold,
-            quick_mode=args.quick_mode,
-            force_hamming_all=args.force_hamming_all,
+def _initialize_run_logging(args):
+    """Initialize run logging context and stdout capture."""
+    context = {
+        "start_dt": datetime.datetime.now(),
+        "stdout_original": sys.stdout,
+        "stdout_buffer": None,
+        "stdout_tee": None,
+        "arguments": _safe_parse_arguments(args),
+        "command": " ".join([sys.executable] + sys.argv),
+    }
+
+    try:
+        context["stdout_buffer"] = io.StringIO()
+        context["stdout_tee"] = TeeStdout(context["stdout_original"], context["stdout_buffer"])
+        sys.stdout = context["stdout_tee"]
+    except Exception as exc:
+        # Non-intrusive: continue even if logging setup fails.
+        print(f"Warning: run logging setup failed: {exc}")
+
+    return context
+
+
+def _finalize_run_logging(context, log_path, status, error_message=None, network_statistics=None):
+    """Finalize run logging and write JSON log file."""
+    end_dt = datetime.datetime.now()
+
+    try:
+        if context.get("stdout_tee") is not None:
+            sys.stdout = context["stdout_original"]
+
+        output_lines = []
+        if context.get("stdout_buffer") is not None:
+            output_lines = context["stdout_buffer"].getvalue().splitlines()
+
+        payload = {
+            "command": context.get("command", ""),
+            "start_time": context["start_dt"].strftime("%Y-%m-%d %H:%M:%S"),
+            "end_time": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            "duration_seconds": round((end_dt - context["start_dt"]).total_seconds(), 3),
+            "status": status,
+            "output_log": output_lines,
+            "arguments": context.get("arguments", {}),
+        }
+
+        if error_message is not None:
+            payload["error"] = str(error_message)
+
+        if network_statistics is not None:
+            payload["network_statistics"] = network_statistics
+
+        with open(log_path, "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as exc:
+        # Non-intrusive: never fail the main run because logging failed.
+        try:
+            print(f"Warning: failed to write run log to {log_path}: {exc}")
+        except Exception:
+            pass
+
+
+def main():
+    """Entry point: filter noise, assign clones, and write outputs."""
+    args = parse_args()
+    filebase, zfilebase, zcfilebase = _resolve_file_bases(args)
+
+    run_log_context = _initialize_run_logging(args)
+    run_status = "success"
+    run_error = None
+    run_network_statistics = None
+
+    try:
+        if args.cross_condition and not args.input_file_2:
+            raise ValueError("--cross-condition requires --input-file-2")
+
+        print(filebase)
+        print(zfilebase)
+        print(zcfilebase)
+
+        # Load primary input and run noise filtering/QC
+        df = pd.read_csv(args.input_file, sep="\t")
+        df, filtered_df = filter_noise(df, args.top_n, args.z_threshold, args.min_group_size)
+
+        lineage_count_df = filtered_df[["cell_barcode", "lineage_count"]].drop_duplicates().reset_index(drop=True)
+        empirical_counts, expected_counts, empirical_cdf, expected_cdf, results = test_truncated_poisson_distribution(
+            lineage_count_df, "lineage_count"
+        )
+        plot_lineage_barcode_qc(zfilebase, empirical_counts, expected_counts, expected_cdf, empirical_cdf)
+
+        # Clone assignment mode
+        if args.cross_condition:
+            df2 = pd.read_csv(args.input_file_2, sep="\t")
+            _, filtered_df_2 = filter_noise(df2, args.top_n, args.z_threshold, args.min_group_size)
+
+            detailed_results_df = assign_clones_cross_condition(
+                filtered_df,
+                filtered_df_2,
+                hamming_threshold=args.hamming_threshold,
+                quick_mode=args.quick_mode,
+                force_hamming_all=args.force_hamming_all,
+                max_lineage_count=args.max_lineage_count,
+                n_jobs=args.n_jobs,
+                source_condition_1=os.path.basename(args.input_file),
+                source_condition_2=os.path.basename(args.input_file_2),
+            )
+
+            clone_groups_df, clone_graph = generate_clone_groups(detailed_results_df)
+
+            matched_1 = extract_unique_matched_cells(detailed_results_df, os.path.basename(args.input_file))
+            matched_1["source_condition"] = os.path.basename(args.input_file)
+
+            matched_2 = extract_unique_matched_cells(detailed_results_df, os.path.basename(args.input_file_2))
+            matched_2["source_condition"] = os.path.basename(args.input_file_2)
+
+            matched_cells_df = pd.concat([matched_1, matched_2], ignore_index=True)
+            matched_cells_df = matched_cells_df[["source_condition", "cell_barcode"]]
+
+            # Keep legacy outputs tied to input-file cells for compatibility.
+            cloneid_clonebarcode_df, cloneid_cellbarcode_df, clone_counts = _build_clone_barcode_outputs(
+                filtered_df, clone_groups_df[clone_groups_df["source_condition"] == os.path.basename(args.input_file)]
+            )
+        else:
+            detailed_results_df = assign_clones_hamming(
+                filtered_df,
+                hamming_threshold=args.hamming_threshold,
+                quick_mode=args.quick_mode,
+                force_hamming_all=args.force_hamming_all,
+                max_lineage_count=args.max_lineage_count,
+                n_jobs=args.n_jobs,
+                source_condition=os.path.basename(args.input_file),
+            )
+
+            clone_groups_df, clone_graph = generate_clone_groups(detailed_results_df)
+            matched_cells_df = extract_unique_matched_cells(
+                detailed_results_df, os.path.basename(args.input_file)
+            )
+
+            cloneid_clonebarcode_df, cloneid_cellbarcode_df, clone_counts = _build_clone_barcode_outputs(
+                filtered_df, clone_groups_df
+            )
+
+        run_network_statistics = clone_graph.get("stats", {})
+        print(f"Clone graph stats: {run_network_statistics}")
+
+        if args.save_graph:
+            save_clone_graph(zcfilebase, clone_groups_df, clone_graph)
+
+        plot_clone_barcode_qc(zcfilebase, clone_counts)
+
+        save_results(
+            filebase=filebase,
+            z_threshold=args.z_threshold,
             max_lineage_count=args.max_lineage_count,
-            n_jobs=args.n_jobs,
-            source_condition_1=os.path.basename(args.input_file),
-            source_condition_2=os.path.basename(args.input_file_2),
+            df=df,
+            filtered_df=filtered_df,
+            cloneid_clonebarcode_df=cloneid_clonebarcode_df,
+            cloneid_cellbarcode_df=cloneid_cellbarcode_df,
+            detailed_results_df=detailed_results_df,
+            clone_groups_df=clone_groups_df,
+            matched_cells_df=matched_cells_df,
+            qc_results=results,
         )
-
-        clone_groups_df = generate_clone_groups(detailed_results_df)
-
-        matched_1 = extract_unique_matched_cells(detailed_results_df, os.path.basename(args.input_file))
-        matched_1["source_condition"] = os.path.basename(args.input_file)
-
-        matched_2 = extract_unique_matched_cells(detailed_results_df, os.path.basename(args.input_file_2))
-        matched_2["source_condition"] = os.path.basename(args.input_file_2)
-
-        matched_cells_df = pd.concat([matched_1, matched_2], ignore_index=True)
-        matched_cells_df = matched_cells_df[["source_condition", "cell_barcode"]]
-
-        # Keep legacy outputs tied to input-file cells for compatibility.
-        cloneid_clonebarcode_df, cloneid_cellbarcode_df, clone_counts = _build_clone_barcode_outputs(
-            filtered_df, clone_groups_df[clone_groups_df["source_condition"] == os.path.basename(args.input_file)]
+    except Exception as exc:
+        run_status = "error"
+        run_error = exc
+        raise
+    finally:
+        run_log_path = f"{zcfilebase}.run_log.json"
+        _finalize_run_logging(
+            context=run_log_context,
+            log_path=run_log_path,
+            status=run_status,
+            error_message=run_error,
+            network_statistics=run_network_statistics,
         )
-    else:
-        detailed_results_df = assign_clones_hamming(
-            filtered_df,
-            hamming_threshold=args.hamming_threshold,
-            quick_mode=args.quick_mode,
-            force_hamming_all=args.force_hamming_all,
-            max_lineage_count=args.max_lineage_count,
-            n_jobs=args.n_jobs,
-            source_condition=os.path.basename(args.input_file),
-        )
-
-        clone_groups_df = generate_clone_groups(detailed_results_df)
-        matched_cells_df = extract_unique_matched_cells(
-            detailed_results_df, os.path.basename(args.input_file)
-        )
-
-        cloneid_clonebarcode_df, cloneid_cellbarcode_df, clone_counts = _build_clone_barcode_outputs(
-            filtered_df, clone_groups_df
-        )
-
-    plot_clone_barcode_qc(zcfilebase, clone_counts)
-
-    save_results(
-        filebase=filebase,
-        z_threshold=args.z_threshold,
-        max_lineage_count=args.max_lineage_count,
-        df=df,
-        filtered_df=filtered_df,
-        cloneid_clonebarcode_df=cloneid_clonebarcode_df,
-        cloneid_cellbarcode_df=cloneid_cellbarcode_df,
-        detailed_results_df=detailed_results_df,
-        clone_groups_df=clone_groups_df,
-        matched_cells_df=matched_cells_df,
-        qc_results=results,
-    )
 
 
 if __name__ == "__main__":
